@@ -6,6 +6,9 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
+    path: Assets/00. Study/Launcher/Launcher.unity
+    guid: 48baccfb48d928e4f9ca5508f7997aef
+  - enabled: 1
     path: Assets/00. Study/00. Scene Port/00. Kingdom VR Tour.unity
     guid: 00173ce5e5b9a094ca72545b3488c2d7
   - enabled: 1
