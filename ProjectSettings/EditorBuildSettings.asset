@@ -14,6 +14,21 @@ EditorBuildSettings:
   - enabled: 1
     path: Assets/00. Study/00. Scene Port/01. Kingdom VR Optimization.unity
     guid: c1b666a2c5db7a344a5d6119ddb50635
+  - enabled: 1
+    path: Assets/00. Study/01. XR Input/00. Controller Readout.unity
+    guid: 0580647ba5a3b8b40a2200eb2bbff772
+  - enabled: 1
+    path: Assets/00. Study/03. XR Interaction/00. XR Interaction Lab.unity
+    guid: 4d6e6ed1dea1cb84ba5da0569c6a63e7
+  - enabled: 1
+    path: Assets/00. Study/04. Throw Physics/00. Throw Range.unity
+    guid: 998e2eba3cb9a5244871e0448d8e9415
+  - enabled: 1
+    path: Assets/00. Study/05. Lake Fishing/00. Panorama Night Lake.unity
+    guid: 0cce83f19d63cd5439c54b4bc38cbcf6
+  - enabled: 1
+    path: Assets/00. Study/06. MR Aquarium/00. Aquarium Window.unity
+    guid: f2aef3309b9ce934f992c4b4a6b7937e
   m_configObjects:
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 052faaac586de48259a63d0c4782560b, type: 3}
     com.unity.xr.arfoundation.simulation_settings: {fileID: 11400000, guid: c649f7161d9bf134cabcb28765d11e94, type: 2}
