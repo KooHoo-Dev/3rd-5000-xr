@@ -18,6 +18,9 @@ EditorBuildSettings:
     path: Assets/00. Study/01. XR Input/00. Controller Readout.unity
     guid: 0580647ba5a3b8b40a2200eb2bbff772
   - enabled: 1
+    path: Assets/00. Study/02. XRI Components/00. XRI Components.unity
+    guid: a01f7cc6a01ad1747a44224f7b4a78d4
+  - enabled: 1
     path: Assets/00. Study/03. XR Interaction/00. XR Interaction Lab.unity
     guid: 4d6e6ed1dea1cb84ba5da0569c6a63e7
   - enabled: 1
