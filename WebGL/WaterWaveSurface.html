@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Water Wave Surface</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #70a4cc; overflow: hidden; font-family: system-ui, sans-serif; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  #panel {
+    position: fixed; top: 12px; left: 12px; width: 260px; max-width: calc(100vw - 24px); box-sizing: border-box;
+    padding: 10px 12px; border-radius: 8px; background: rgba(10, 20, 30, 0.72); color: #e8eef3; font-size: 12px;
+  }
+  #panel label { display: grid; grid-template-columns: 1fr 70px 38px; align-items: center; gap: 6px; margin: 4px 0; }
+  #panel label.row { grid-template-columns: 1fr auto; }
+  #panel input[type=range] { width: 70px; }
+  #panel output { text-align: right; font-variant-numeric: tabular-nums; }
+  #panel select { font-size: 12px; }
+  #error { white-space: pre-wrap; color: #ff9b9b; font-family: ui-monospace, monospace; font-size: 11px; }
+  #hint { opacity: 0.7; margin-top: 6px; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="panel">
+  <div id="sliders"></div>
+  <label class="row">물빛 <input type="color" id="deep" value="#042a45"></label>
+  <label class="row">하늘빛 <input type="color" id="sky" value="#70a4cc"></label>
+  <label class="row">단계 보기 (SG_STEP)
+    <select id="step">
+      <option value="0">최종</option>
+      <option value="1">1. 파도 높이</option>
+      <option value="2">2. 파도 법선</option>
+      <option value="3">3. 프레넬</option>
+      <option value="4">4. 반사광</option>
+    </select>
+  </label>
+  <label class="row">흔한 실수 (SG_OFF) <input type="checkbox" id="off"></label>
+  <div id="hint">드래그: 회전 · 휠: 확대/축소</div>
+  <div id="error"></div>
+</div>
+
+<script>
+// ============================================================================================
+// 물결 수면 (WaterWaveSurface.shader + core.hlsl) 을 WebGL2 / GLSL ES 3.00 문자열로 옮긴 것.
+// 셰이더 소스는 모두 JS 템플릿 문자열이고, Unity 의 #include 대신 문자열을 이어 붙여 한 셰이더를 만든다.
+//   정점 셰이더   = HEADER + defines + COMMON + CORE + WATER_VS
+//   프래그먼트    = HEADER + defines + COMMON + WATER_FS_PRE + CORE + WATER_FS
+// '단계 보기'와 SG_OFF 는 #define 문자열을 앞에 끼워 넣고 프로그램을 다시 만드는 방식으로 켠다.
+// ============================================================================================
+
+// GLSL ES 3.00 은 #version 이 문자열의 맨 첫 줄이어야 한다 (앞에 빈 줄이나 공백이 있으면 컴파일 실패).
+// 프래그먼트 셰이더의 float 정밀도는 기본값이 없어 직접 정한다. 두 단계에 함께 선언하는 uniform 은
+// 정밀도가 같아야 하므로 정점 셰이더의 기본값과 같은 highp 로 둔다.
+const HEADER = `#version 300 es
+precision highp float;
+`;
+
+// 두 단계가 함께 쓰는 선언. Unity 쪽의 CBUFFER(UnityPerMaterial), 엔진 내장 값, SgInput 에 해당한다.
+const COMMON = /* glsl */ `
+// HLSL 의 saturate 는 GLSL 에 없다.
+#define saturate(x) clamp((x), 0.0, 1.0)
+
+// ---- 머티리얼 값 (CBUFFER UnityPerMaterial) ----
+uniform float uWaveHeight;   // _WaveHeight
+uniform float uWaveLength;   // _WaveLength
+uniform float uWaveSpeed;    // _WaveSpeed
+uniform float uWaveAngle;    // _WaveAngle
+uniform vec4  uDeepColor;    // _DeepColor (선형 색)
+uniform vec4  uSkyColor;     // _SkyColor  (선형 색)
+uniform float uSpecStrength; // _SpecStrength
+uniform float uSpecPower;    // _SpecPower
+
+// ---- Unity 가 넣어 주던 내장 값 ----
+uniform float uTime;         // _Time.y
+uniform mat4  uModel;        // unity_ObjectToWorld
+uniform mat3  uNormalMatrix; // TransformObjectToWorldNormal 의 행렬 (모델 행렬 3x3 의 역전치)
+uniform mat4  uViewProj;     // UNITY_MATRIX_VP
+uniform vec3  uCameraPosWS;  // _WorldSpaceCameraPos
+uniform vec3  uLightDirWS;   // 주 광원 방향 (표면에서 광원 쪽)
+uniform vec3  uLightColor;   // 주 광원 색 (선형)
+uniform vec3  uAmbient;      // SampleSH 대신 쓰는 고정 환경광
+
+// core 가 받는 입력. 메시 무대의 공통 형식이다.
+struct SgInput
+{
+    vec2 uv;
+    vec3 positionOS;
+    vec3 normalWS;
+    vec3 viewWS;
+    vec3 lightDirWS;
+    vec3 lightColor;
+    vec3 lighting;
+    float time;
+};
+`;
+
+// core.hlsl 을 GLSL 로 옮긴 것. float2/3/4 -> vec2/3/4, frac -> fract, lerp -> mix 만 바뀌었다.
+const CORE = /* glsl */ `
+// SG_STEP: '단계 보기'가 중간 결과를 꺼내는 표시. 정의되지 않았으면 아무 일도 하지 않는다.
+#ifndef SG_STEP
+#define SG_STEP(n, rgb)
+#endif
+
+// 오브젝트 공간 법선을 월드로 바꾸는 자리. 프래그먼트 셰이더가 CORE 앞에서 행렬로 정의한다.
+#ifndef WAVE_NORMAL_TO_WORLD
+#define WAVE_NORMAL_TO_WORLD(n) (n)
+#endif
+
+#define WAVE_TAU 6.2831853
+
+// 파도 하나. x 는 높이, y 와 z 는 높이를 x, z 로 미분한 기울기 (dh/dx, dh/dz).
+vec3 waveOne(vec2 xz, float angleDeg, float lambda, float amp, float speed, float time)
+{
+    float a = angleDeg * 0.0174533;
+    // 각도는 Y 회전처럼 읽는다: 0 은 +Z, 90 은 +X 쪽으로 나아간다.
+    vec2 dir = vec2(sin(a), cos(a));
+    float k = WAVE_TAU / lambda;
+    float phase = k * dot(dir, xz) - WAVE_TAU * fract(time * speed / lambda);
+    float s = sin(phase);
+    float c = amp * k * cos(phase);
+    return vec3(amp * s, c * dir.x, c * dir.y);
+}
+
+// 사인파 세 개의 합. 둘째는 55도 돌고 파장 0.77 배, 셋째는 -40도 돌고 파장 0.58 배.
+vec3 waveSum(vec2 xz, float time)
+{
+    vec3 w = waveOne(xz, uWaveAngle, uWaveLength, uWaveHeight, uWaveSpeed, time);
+    w = w + waveOne(xz, uWaveAngle + 55.0, uWaveLength * 0.77, uWaveHeight * 0.6, uWaveSpeed * 0.88, time);
+    w = w + waveOne(xz, uWaveAngle - 40.0, uWaveLength * 0.58, uWaveHeight * 0.4, uWaveSpeed * 0.76, time);
+    return w;
+}
+
+// 정점 단계: 높이만 바꾼다. 법선은 sgEffect 에서 다시 구한다.
+vec3 sgVertex(vec3 positionOS, vec3 normalOS, vec2 uv, float time)
+{
+    float h = waveSum(positionOS.xz, time).x;
+    return vec3(positionOS.x, positionOS.y + h, positionOS.z);
+}
+
+vec4 sgEffect(SgInput i)
+{
+    // 높이(y)만 밀었으므로 xz 는 원래 자리 그대로라 같은 식으로 이 픽셀의 높이와 기울기가 나온다.
+    vec3 w = waveSum(i.positionOS.xz, i.time);
+
+    // 1. 파도 높이: 진폭 합(2)으로 나눠 0~1 회색. sRGB 로 밝아지므로 제곱해서 보여 준다.
+    float h01 = saturate(0.5 + 0.5 * w.x / max(uWaveHeight * 2.0, 0.0001));
+    float hShown = h01 * h01;
+    SG_STEP(1, vec3(hShown, hShown, hShown));
+
+    // 시선과 광원의 하프 벡터 (Blinn-Phong).
+    vec3 v = i.viewWS;
+    vec3 halfDir = normalize(i.lightDirWS + v);
+
+#ifdef SG_OFF
+    // 흔한 실수: 정점만 밀고 법선은 평면의 원래 법선을 그대로 쓴다.
+    vec3 flatN = i.normalWS;
+    float fresnelOff = 0.02 + 0.98 * pow(1.0 - saturate(dot(flatN, v)), 5.0);
+    float specOff = pow(saturate(dot(flatN, halfDir)), uSpecPower) * uSpecStrength;
+    vec3 specColorOff = i.lightColor * specOff;
+    vec3 colorOff = mix(uDeepColor.rgb, uSkyColor.rgb, fresnelOff) + specColorOff;
+    float specAlphaOff = max(specColorOff.r, max(specColorOff.g, specColorOff.b));
+    return vec4(colorOff, saturate(0.35 + fresnelOff * 1.2 + specAlphaOff));
+#endif
+
+    // 2. 파도 법선: 높이 y = h(x, z) 인 면의 법선은 (-dh/dx, 1, -dh/dz) 방향이다.
+    vec3 n = normalize(WAVE_NORMAL_TO_WORLD(normalize(vec3(-w.y, 1.0, -w.z))));
+    vec3 nShown = n * 0.5 + 0.5;
+    SG_STEP(2, nShown * nShown);
+
+    // 3. 프레넬 (Schlick 근사, 물의 정면 반사율 약 0.02).
+    float fresnel = 0.02 + 0.98 * pow(1.0 - saturate(dot(n, v)), 5.0);
+    SG_STEP(3, vec3(fresnel, fresnel, fresnel));
+
+    // 4. 반사광 (Blinn-Phong).
+    float spec = pow(saturate(dot(n, halfDir)), uSpecPower) * uSpecStrength;
+    vec3 specColor = i.lightColor * spec;
+    SG_STEP(4, specColor);
+
+    // 최종: 프레넬로 물빛과 하늘빛을 섞고 반사광을 더한다. 알파도 프레넬과 반사광으로 정한다.
+    vec3 color = mix(uDeepColor.rgb, uSkyColor.rgb, fresnel) + specColor;
+    float specAlpha = max(specColor.r, max(specColor.g, specColor.b));
+    float alpha = saturate(0.35 + fresnel * 1.2 + specAlpha);
+    return vec4(color, alpha);
+}
+`;
+
+// WaterWaveSurface.shader 의 vert. Attributes -> in, Varyings -> out.
+const WATER_VS = /* glsl */ `
+in vec3 aPositionOS; // POSITION
+in vec3 aNormalOS;   // NORMAL
+in vec2 aUV;         // TEXCOORD0
+
+out vec2 vUV;
+out vec3 vPositionOS;
+out vec3 vPositionWS;
+out vec3 vNormalWS;
+
+void main()
+{
+    // 파도 높이만큼 민 위치로 월드 위치와 화면 위치를 구한다.
+    vec3 p = sgVertex(aPositionOS, aNormalOS, aUV, uTime);
+    vPositionWS = (uModel * vec4(p, 1.0)).xyz;        // TransformObjectToWorld
+    gl_Position = uViewProj * vec4(vPositionWS, 1.0);  // TransformWorldToHClip
+    // 평면의 원래 법선. 파도 법선은 core 가 픽셀마다 다시 구한다.
+    vNormalWS = normalize(uNormalMatrix * aNormalOS);  // TransformObjectToWorldNormal
+    vPositionOS = p;
+    vUV = aUV;
+}
+`;
+
+// WaterWaveSurface.shader 에서 #include "core.hlsl" 앞에 있던 부분.
+const WATER_FS_PRE = /* glsl */ `
+in vec2 vUV;
+in vec3 vPositionOS;
+in vec3 vPositionWS;
+in vec3 vNormalWS;
+
+out vec4 outColor; // SV_Target
+
+// 평면을 돌리거나 늘려도 조명이 맞도록 파도 법선을 월드로 바꾼다.
+#define WAVE_NORMAL_TO_WORLD(n) (uNormalMatrix * (n))
+`;
+
+// WaterWaveSurface.shader 의 frag.
+const WATER_FS = /* glsl */ `
+// Unity 는 sRGB 프레임버퍼가 자동으로 바꿔 주지만 WebGL 기본 캔버스는 아니라 직접 바꾼다.
+vec3 linearToSrgb(vec3 c)
+{
+    c = max(c, 0.0);
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(lo, hi, step(0.0031308, c));
+}
+
+void main()
+{
+    vec3 normalWS = normalize(vNormalWS);
+    // GetMainLight 대신 uniform 광원. 그림자 맵이 없으므로 shadowAttenuation = 1 로 본다.
+    vec3 lightDir = normalize(uLightDirWS);
+    vec3 lightColor = uLightColor;
+
+    SgInput i;
+    i.uv = vUV;
+    i.positionOS = vPositionOS;
+    i.normalWS = normalWS;
+    i.viewWS = normalize(uCameraPosWS - vPositionWS); // GetWorldSpaceNormalizeViewDir
+    i.lightDirWS = lightDir;
+    i.lightColor = lightColor;
+    i.lighting = lightColor * saturate(dot(normalWS, lightDir)) + uAmbient;
+    i.time = uTime;
+
+    vec4 c = sgEffect(i);
+    outColor = vec4(linearToSrgb(c.rgb), c.a);
+}
+`;
+
+// 수면 아래가 비쳐 보이도록 까는 불투명 바닥 (원본에는 없는, 미리보기용).
+const FLOOR_VS = /* glsl */ `
+in vec3 aPositionOS;
+in vec3 aNormalOS;
+in vec2 aUV;
+out vec3 vPositionWS;
+void main()
+{
+    vPositionWS = (uModel * vec4(aPositionOS, 1.0)).xyz;
+    gl_Position = uViewProj * vec4(vPositionWS, 1.0);
+}
+`;
+const FLOOR_FS = /* glsl */ `
+in vec3 vPositionWS;
+out vec4 outColor;
+void main()
+{
+    vec2 cell = floor(vPositionWS.xz);
+    float checker = mod(cell.x + cell.y, 2.0);
+    vec3 albedo = mix(vec3(0.42, 0.36, 0.24), vec3(0.52, 0.45, 0.31), checker);
+    vec3 c = albedo * (uLightColor * saturate(dot(vec3(0.0, 1.0, 0.0), normalize(uLightDirWS))) + uAmbient);
+    outColor = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+}
+`;
+
+// ============================================================================================
+// 아래는 WebGL 호스트: 메시, 카메라, 혼합 상태, uniform 넣기. Unity 가 대신 해 주던 일들이다.
+// ============================================================================================
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: true });
+const errorBox = document.getElementById('error');
+if (!gl) errorBox.textContent = 'WebGL2 를 지원하지 않는 브라우저입니다.';
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    const numbered = src.split('\n').map((l, n) => String(n + 1).padStart(3) + ': ' + l).join('\n');
+    throw new Error(gl.getShaderInfoLog(s) + '\n' + numbered);
+  }
+  return s;
+}
+
+function link(vsSrc, fsSrc) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+  // 정점 속성 위치를 고정해 두면 두 프로그램이 같은 VAO 를 쓸 수 있다.
+  gl.bindAttribLocation(p, 0, 'aPositionOS');
+  gl.bindAttribLocation(p, 1, 'aNormalOS');
+  gl.bindAttribLocation(p, 2, 'aUV');
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  p.loc = {};
+  const count = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let k = 0; k < count; k++) {
+    const name = gl.getActiveUniform(p, k).name;
+    p.loc[name] = gl.getUniformLocation(p, name);
+  }
+  return p;
+}
+
+// SG_STEP 과 SG_OFF 를 #define 문자열로 끼워 넣어 수면 프로그램을 만든다.
+function buildWater(step, off) {
+  let defines = '';
+  if (step > 0) {
+    defines += `#define SG_VIEW ${step}\n`;
+    defines += `#define SG_STEP(n, rgb) if ((n) == SG_VIEW) return vec4((rgb), 1.0);\n`;
+  }
+  if (off) defines += '#define SG_OFF\n';
+  return link(
+    HEADER + defines + COMMON + CORE + WATER_VS,
+    HEADER + defines + COMMON + WATER_FS_PRE + CORE + WATER_FS
+  );
+}
+
+// 한 변 size m, cells 칸인 XZ 평면 (WaterSurfaceGrid.cs 와 같은 꼴). 법선은 +Y.
+// 수면은 깊이를 쓰지 않으므로 삼각형 순서가 곧 앞뒤다. 기본 카메라(-Z 쪽)에서 먼 줄(+Z)부터 그린다.
+function makeGrid(size, cells, y) {
+  const n = cells + 1, half = size / 2, step = size / cells;
+  const pos = [], nrm = [], uv = [], idx = [];
+  for (let r = 0; r < n; r++) {
+    const z = half - r * step;
+    for (let c = 0; c < n; c++) {
+      const x = -half + c * step;
+      pos.push(x, y, z); nrm.push(0, 1, 0); uv.push(c / cells, 1 - r / cells);
+    }
+  }
+  for (let r = 0; r < cells; r++) {
+    for (let c = 0; c < cells; c++) {
+      const v01 = r * n + c, v11 = v01 + 1;       // 먼 줄 (z 큼)
+      const v00 = (r + 1) * n + c, v10 = v00 + 1; // 가까운 줄 (z 작음)
+      idx.push(v00, v10, v01, v10, v11, v01);     // 위에서 볼 때 앞면
+    }
+  }
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  [[pos, 3], [nrm, 3], [uv, 2]].forEach(([data, size], loc) => {
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(data), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(loc);
+    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+  });
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: idx.length };
+}
+
+// ---- 행렬 (열 우선) ----
+function perspective(fovyDeg, aspect, near, far) {
+  const f = 1 / Math.tan(fovyDeg * Math.PI / 360), nf = 1 / (near - far);
+  return new Float32Array([f / aspect, 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) * nf, -1, 0, 0, 2 * far * near * nf, 0]);
+}
+// Unity 처럼 왼손 좌표계로 본다: -Z 에서 +Z 를 보면 +X 가 화면 오른쪽. 그래야 파도 방향 각도가 Unity 와 같게 보인다.
+function lookAtLH(eye, target) {
+  const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const norm = a => { const l = Math.hypot(...a); return [a[0] / l, a[1] / l, a[2] / l]; };
+  const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const f = norm(sub(target, eye)), r = norm(cross([0, 1, 0], f)), u = cross(f, r);
+  return new Float32Array([
+    r[0], u[0], -f[0], 0,
+    r[1], u[1], -f[1], 0,
+    r[2], u[2], -f[2], 0,
+    -dot(r, eye), -dot(u, eye), dot(f, eye), 1,
+  ]);
+}
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0;
+    for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k];
+    o[c * 4 + r] = s;
+  }
+  return o;
+}
+const IDENTITY4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+const IDENTITY3 = new Float32Array([1, 0, 0, 0, 1, 0, 0, 0, 1]);
+
+// ---- 색: 인스펙터 값(sRGB)을 셰이더에 넣을 때 선형으로 바꾼다 (Unity 선형 색 공간과 같은 처리) ----
+const toLinear = c => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
+const hexToLinear = hex => [1, 3, 5].map(i => toLinear(parseInt(hex.substr(i, 2), 16) / 255));
+
+// ---- 머티리얼 값 (Properties 블록과 같은 이름, 범위, 기본값) ----
+const material = [
+  { key: 'uWaveHeight', label: '파도 높이', min: 0, max: 0.14, value: 0.135 },
+  { key: 'uWaveLength', label: '파장', min: 0.8, max: 6, value: 1.3 },
+  { key: 'uWaveSpeed', label: '파도 속도', min: 0, max: 3, value: 0.5 },
+  { key: 'uWaveAngle', label: '파도 방향 (도)', min: 0, max: 360, value: 0 },
+  { key: 'uSpecStrength', label: '반사광 세기', min: 0, max: 3, value: 0 },
+  { key: 'uSpecPower', label: '반사광 날카로움', min: 4, max: 256, value: 4 },
+];
+const sliders = document.getElementById('sliders');
+for (const m of material) {
+  const label = document.createElement('label');
+  label.innerHTML = `${m.label}<input type="range" min="${m.min}" max="${m.max}" step="${(m.max - m.min) / 200}" value="${m.value}"><output>${m.value}</output>`;
+  const input = label.querySelector('input'), out = label.querySelector('output');
+  input.addEventListener('input', () => { m.value = parseFloat(input.value); out.textContent = +m.value.toFixed(3); });
+  sliders.appendChild(label);
+}
+
+// ---- 장면 ----
+let water = null, floorProg = null, waterMesh = null, floorMesh = null;
+function rebuildWater() {
+  try {
+    water = buildWater(+document.getElementById('step').value, document.getElementById('off').checked);
+    errorBox.textContent = '';
+  } catch (e) { errorBox.textContent = e.message; console.error(e.message); }
+}
+if (gl) {
+  try {
+    floorProg = link(HEADER + COMMON + FLOOR_VS, HEADER + COMMON + FLOOR_FS);
+  } catch (e) { errorBox.textContent = e.message; console.error(e.message); }
+  rebuildWater();
+  waterMesh = makeGrid(10, 100, 0);   // 수면: 한 변 10 m, 100 칸
+  floorMesh = makeGrid(16, 16, -0.6); // 바닥
+  document.getElementById('step').addEventListener('change', rebuildWater);
+  document.getElementById('off').addEventListener('change', rebuildWater);
+}
+
+// ---- 카메라 궤도 조작 ----
+const cam = { yaw: 0, pitch: 22, dist: 9 };
+let drag = null;
+canvas.addEventListener('pointerdown', e => { drag = { x: e.clientX, y: e.clientY }; canvas.setPointerCapture(e.pointerId); });
+canvas.addEventListener('pointerup', () => { drag = null; });
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  cam.yaw -= (e.clientX - drag.x) * 0.3;
+  cam.pitch = Math.min(85, Math.max(3, cam.pitch + (e.clientY - drag.y) * 0.3));
+  drag = { x: e.clientX, y: e.clientY };
+});
+canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dist = Math.min(30, Math.max(2, cam.dist * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+
+// 해는 카메라 맞은편(+Z) 낮은 곳: 반사광 세기와 날카로움을 올리면 해 반짝임 길이 생긴다.
+const lightDir = (() => { const d = [0.25, 0.4, 1.0], l = Math.hypot(...d); return d.map(v => v / l); })();
+const lightColor = [255, 244, 214].map(v => toLinear(v / 255)); // Unity 기본 Directional Light 색
+const ambient = [0.18, 0.22, 0.28];
+
+function setCommon(p, viewProj, eye, time) {
+  const L = p.loc;
+  if (L.uViewProj) gl.uniformMatrix4fv(L.uViewProj, false, viewProj);
+  if (L.uModel) gl.uniformMatrix4fv(L.uModel, false, IDENTITY4);
+  if (L.uNormalMatrix) gl.uniformMatrix3fv(L.uNormalMatrix, false, IDENTITY3);
+  if (L.uCameraPosWS) gl.uniform3fv(L.uCameraPosWS, eye);
+  if (L.uLightDirWS) gl.uniform3fv(L.uLightDirWS, lightDir);
+  if (L.uLightColor) gl.uniform3fv(L.uLightColor, lightColor);
+  if (L.uAmbient) gl.uniform3fv(L.uAmbient, ambient);
+  if (L.uTime) gl.uniform1f(L.uTime, time);
+  for (const m of material) if (L[m.key]) gl.uniform1f(L[m.key], m.value);
+  if (L.uDeepColor) gl.uniform4fv(L.uDeepColor, [...hexToLinear(document.getElementById('deep').value), 1]);
+  if (L.uSkyColor) gl.uniform4fv(L.uSkyColor, [...hexToLinear(document.getElementById('sky').value), 1]);
+}
+
+function frame(ms) {
+  requestAnimationFrame(frame);
+  if (!gl || !water || !floorProg) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+  gl.viewport(0, 0, w, h);
+
+  const yaw = cam.yaw * Math.PI / 180, pitch = cam.pitch * Math.PI / 180;
+  const eye = [Math.sin(yaw) * Math.cos(pitch) * cam.dist, Math.sin(pitch) * cam.dist, -Math.cos(yaw) * Math.cos(pitch) * cam.dist];
+  const viewProj = mul(perspective(50, w / h, 0.1, 100), lookAtLH(eye, [0, 0, 0]));
+  const time = ms / 1000;
+
+  // 하늘색 배경은 하늘빛과 맞춘다 (캔버스는 sRGB 값을 그대로 받는다).
+  const sky = document.getElementById('sky').value;
+  gl.clearColor(...[1, 3, 5].map(i => parseInt(sky.substr(i, 2), 16) / 255), 1);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST);
+  gl.depthFunc(gl.LEQUAL);
+  gl.enable(gl.CULL_FACE); // Unity 기본값 Cull Back
+
+  // 1) 불투명 바닥 (Queue Geometry): 깊이를 쓴다.
+  gl.disable(gl.BLEND);
+  gl.depthMask(true);
+  gl.useProgram(floorProg);
+  setCommon(floorProg, viewProj, eye, time);
+  gl.bindVertexArray(floorMesh.vao);
+  gl.drawElements(gl.TRIANGLES, floorMesh.count, gl.UNSIGNED_SHORT, 0);
+
+  // 2) 수면 (Queue Transparent): Blend SrcAlpha OneMinusSrcAlpha, ZWrite Off.
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false);
+  gl.useProgram(water);
+  setCommon(water, viewProj, eye, time);
+  gl.bindVertexArray(waterMesh.vao);
+  gl.drawElements(gl.TRIANGLES, waterMesh.count, gl.UNSIGNED_SHORT, 0);
+  gl.depthMask(true);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
